@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from model import GPT, GPTConfig, size_report
-from checkpoint import save_checkpoint, read_checkpoint, tokenizer_hash
+from checkpoint import save_checkpoint, read_checkpoint, tokenizer_hash, replace_with_retry
 
 ROOT = Path(__file__).resolve().parent
 
@@ -23,6 +23,8 @@ def dataset_fingerprint(directory, stage):
         names = [f'{split}.bin']
         if stage == 'sft':
             names.append(f'{split}-mask.bin')
+            if (Path(directory) / f'{split}-conversations.npy').exists():
+                names.append(f'{split}-conversations.npy')
         for name in names:
             digest.update(name.encode())
             with (Path(directory) / name).open('rb') as stream:
@@ -35,18 +37,31 @@ def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
-    tmp.write_text(json.dumps(value, indent=2, allow_nan=False), encoding='utf-8')
-    tmp.replace(path)
+    try:
+        tmp.write_text(json.dumps(value, indent=2, allow_nan=False), encoding='utf-8')
+        replace_with_retry(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 class TokenDataset:
     def __init__(self, directory, context, stage, vocab_size):
         self.context, self.stage = context, stage
         self.streams = {}
+        self.conversations = {}
         for split in ('train', 'val'):
             tokens = np.memmap(Path(directory) / f'{split}.bin', dtype='<u2', mode='r')
             mask = np.memmap(Path(directory) / f'{split}-mask.bin', dtype='u1', mode='r') if stage == 'sft' else None
-            if len(tokens) <= context or (mask is not None and len(mask) != len(tokens)):
+            index_path = Path(directory) / f'{split}-conversations.npy'
+            if stage == 'sft' and index_path.exists():
+                index = np.load(index_path, allow_pickle=False)
+                if (index.ndim != 2 or index.shape[1] != 2 or not len(index) or index.dtype.kind not in 'iu'
+                        or np.any(index < 0) or np.any(index[:, 1] < 2)
+                        or np.any(index[:, 1] > len(tokens))
+                        or np.any(index[:, 0] > len(tokens) - index[:, 1])):
+                    raise ValueError('Invalid conversation boundary index')
+                self.conversations[split] = index
+            if (split not in self.conversations and len(tokens) <= context) or (mask is not None and len(mask) != len(tokens)):
                 raise ValueError(f'{split} stream is too short or mask length differs')
             if int(tokens.max()) >= vocab_size:
                 raise ValueError('Dataset token ID exceeds model vocabulary')
@@ -58,12 +73,27 @@ class TokenDataset:
             if mask is not None:
                 mask._mmap.close()
         self.streams.clear()
+        self.conversations.clear()
 
     def batch(self, split, rng, count, device):
         tokens, mask = self.streams[split]
         xs, ys = [], []
         for _ in range(count):
             for _ in range(1000):
+                if split in self.conversations:
+                    index = self.conversations[split]
+                    start, length = map(int, index[int(rng.integers(0, len(index)))])
+                    offset = int(rng.integers(0, max(1, length - self.context)))
+                    size = min(self.context, length - offset - 1)
+                    i = start + offset
+                    x = np.zeros(self.context, dtype=np.int64)
+                    y = np.full(self.context, -1, dtype=np.int64)
+                    x[:size] = tokens[i:i + size]
+                    y[:size] = tokens[i + 1:i + size + 1]
+                    y[:size][mask[i + 1:i + size + 1] == 0] = -1
+                    if np.any(y != -1):
+                        break
+                    continue
                 i = int(rng.integers(0, len(tokens) - self.context))
                 x = tokens[i:i + self.context].astype(np.int64)
                 y = tokens[i + 1:i + self.context + 1].astype(np.int64)
@@ -109,7 +139,7 @@ def main():
     p.add_argument('--seconds', type=float, default=3600)
     p.add_argument('--steps', type=int, default=1000)
     p.add_argument('--target-loss', type=float,
-                   help='Stop below this training loss or at --seconds; overrides the step limit')
+                   help='Stop at or below this training loss or at --seconds; overrides the step limit')
     p.add_argument('--batch', type=int, default=1)
     p.add_argument('--accumulation', type=int, default=8)
     p.add_argument('--optimizer', choices=['muon', 'adamw'], default='muon')
@@ -261,7 +291,7 @@ def main():
                        elapsed_seconds=time.monotonic() - begin,
                        tokens=step * args.batch * args.accumulation * c.block_size,
                        gpu_peak_mb=torch.cuda.max_memory_allocated() / 2**20 if device == 'cuda' else 0)
-            target_reached = args.target_loss is not None and total_loss < args.target_loss
+            target_reached = args.target_loss is not None and total_loss <= args.target_loss
             if step == 1 or step % args.eval_every == 0 or (args.target_loss is None and step == args.steps) or target_reached:
                 row['val_loss'] = evaluate(model, dataset, args.eval_batches, args.batch, device)
                 if not math.isfinite(row['val_loss']):

@@ -1,11 +1,24 @@
 """Atomic, versioned floating point checkpoints. Packed legacy files are untouched."""
 import hashlib
+import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
 import torch
 from model import GPT, GPTConfig
 FORMAT = 'agmgpt-nanochat-v1'
+
+
+def replace_with_retry(source, destination):
+    """Allow transient Windows reader/sync locks to clear before replacing a file."""
+    for attempt in range(20):
+        try:
+            Path(source).replace(destination)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(min(.02 * 2 ** attempt, .5))
 
 
 def tokenizer_hash(path):
@@ -18,7 +31,7 @@ def atomic_save(path, payload):
     tmp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
     try:
         torch.save(payload, tmp)
-        tmp.replace(path)
+        replace_with_retry(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
 

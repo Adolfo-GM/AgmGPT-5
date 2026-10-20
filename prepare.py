@@ -1,12 +1,30 @@
 """Build reproducible train/validation streams with the existing frozen BPE."""
 import argparse
 import json
+import re
 from pathlib import Path
 import numpy as np
 from tokenizers import Tokenizer
 from checkpoint import tokenizer_hash
 
 ROOT = Path(__file__).resolve().parent
+
+
+def sft_text_documents(text):
+    """Strip boundary markup while keeping every turn of a conversation together."""
+    if '<conversation>' not in text and '</conversation>' not in text:
+        return [s.strip() + '<|eos|>' for s in text.split('<|eos|>') if s.strip()]
+    pattern = re.compile(r'<conversation>\s*(.*?)\s*</conversation>', re.S)
+    blocks = pattern.findall(text)
+    if not blocks or pattern.sub('', text).strip():
+        raise ValueError('Unclosed, nested or mixed conversation wrappers')
+    turn = re.compile(r'<\|user\|>\s*(.*?)\s*<\|ai\|>\s*(.*?)\s*<\|eos\|>', re.S)
+    for block in blocks:
+        pairs = turn.findall(block)
+        if (not pairs or turn.sub('', block).strip() or '<conversation>' in block
+                or any(not u.strip() or not a.strip() for u, a in pairs)):
+            raise ValueError('Conversation must contain complete ordered user/assistant exchanges')
+    return blocks
 
 
 def prepare(source, output, stage='pretrain', val_fraction=.05, seed=1337, tokenizer=None):
@@ -20,7 +38,8 @@ def prepare(source, output, stage='pretrain', val_fraction=.05, seed=1337, token
     eos, ai = tok.token_to_id('<|eos|>'), tok.token_to_id('<|ai|>')
     if eos is None or ai is None:
         raise ValueError('Tokenizer must have <|eos|> and <|ai|>')
-    files = sorted(p for p in source.rglob('*') if p.suffix.lower() in ('.txt', '.jsonl') and p.is_file())
+    files = sorted(p for p in source.rglob('*') if p.suffix.lower() in ('.txt', '.jsonl') and p.is_file()
+                   and not any(part.startswith('.') or part == '_generator' for part in p.relative_to(source).parts))
     if len(files) < 2:
         raise ValueError('Provide at least two source files for a file-level held-out split')
     rng = np.random.default_rng(seed)
@@ -30,6 +49,7 @@ def prepare(source, output, stage='pretrain', val_fraction=.05, seed=1337, token
                 seed=seed, split='whole source files', files={'train': [], 'val': []})
     for split in ('train', 'val'):
         total = records = 0
+        boundaries = []
         with (output / f'{split}.bin').open('wb') as token_file, (output / f'{split}-mask.bin').open('wb') as mask_file:
             for i, path in enumerate(files):
                 if (i in val_indices) != (split == 'val'):
@@ -45,10 +65,13 @@ def prepare(source, output, stage='pretrain', val_fraction=.05, seed=1337, token
                         if stage == 'sft':
                             if 'messages' in record:
                                 parts = []
-                                for msg in record['messages']:
+                                messages = record['messages']
+                                if not messages or len(messages) % 2:
+                                    raise ValueError('SFT conversation must end with an assistant answer')
+                                for index, msg in enumerate(messages):
                                     role = msg['role']
-                                    if role not in ('user', 'assistant'):
-                                        raise ValueError('SFT messages support user/assistant roles')
+                                    if role != ('user' if index % 2 == 0 else 'assistant') or not msg['content'].strip():
+                                        raise ValueError('SFT messages must alternate user and assistant')
                                     parts.append(('<|user|> ' if role == 'user' else '<|ai|> ') + msg['content'] + (' <|eos|>\n' if role == 'assistant' else ' '))
                                 documents.append(''.join(parts))
                             else:
@@ -56,7 +79,7 @@ def prepare(source, output, stage='pretrain', val_fraction=.05, seed=1337, token
                         else:
                             documents.append(record['text'])
                 elif stage == 'sft':
-                    documents = [s.strip() + '<|eos|>' for s in text.split('<|eos|>') if s.strip()]
+                    documents = sft_text_documents(text)
                 else:
                     documents = [text]
                 for document in documents:
@@ -84,12 +107,17 @@ def prepare(source, output, stage='pretrain', val_fraction=.05, seed=1337, token
                         mask = [1] * len(ids)
                     np.asarray(ids, dtype='<u2').tofile(token_file)
                     np.asarray(mask, dtype='u1').tofile(mask_file)
+                    boundaries.append((total, len(ids)))
                     total += len(ids)
                     records += 1
         if not total:
             raise ValueError(f'Empty {split} split')
         meta[f'{split}_tokens'] = total
         meta[f'{split}_records'] = records
+        if stage == 'sft':
+            np.save(output / f'{split}-conversations.npy', np.asarray(boundaries, dtype='<u8'), allow_pickle=False)
+    if stage == 'sft':
+        meta['sampling'] = 'whole conversations; original turn order; wrappers stripped before tokenization'
     (output / 'dataset.json').write_text(json.dumps(meta, indent=2), encoding='utf-8')
     return meta
 

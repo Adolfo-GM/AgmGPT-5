@@ -13,3 +13,7 @@ STOP-smoke
 /data/*
 !/data/tokenizer.json
 !/data/sample.txt
+/generate_data_2.local.py
+/data/source/generated_data_2/
+.env
+.env.*

@@ -105,6 +105,44 @@ class RuntimeTests(unittest.TestCase):
             prepare(source, base, stage='pretrain')
             self.assertTrue(np.all(np.fromfile(base / 'train-mask.bin', dtype='u1') == 1))
 
+    def test_multiturn_boundaries_preserve_context_and_ignore_padding(self):
+        from prepare import sft_text_documents
+        from tokenizers import Tokenizer
+        tok = Tokenizer.from_file(str(ROOT / 'data/tokenizer.json'))
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'source'
+            source.mkdir()
+            for i in range(2):
+                text = ('<conversation>\n'
+                        f'<|user|> My cat is named Miso{i}. <|ai|> Miso{i} sounds charming! <|eos|>\n'
+                        f'<|user|> What was his name? <|ai|> His name is Miso{i}. <|eos|>\n'
+                        '</conversation>\n')
+                (source / f'{i}.txt').write_text(text)
+            (source / '_generator').mkdir()
+            (source / '_generator/notes.txt').write_text('This is metadata, not a conversation.')
+            output = Path(tmp) / 'prepared'
+            info = prepare(source, output, 'sft')
+            self.assertEqual(info['train_records'], 1)
+            self.assertEqual(info['val_records'], 1)
+            ds = TokenDataset(output, 256, 'sft', 8192)
+            try:
+                for split in ('train', 'val'):
+                    index = np.load(output / f'{split}-conversations.npy', allow_pickle=False)
+                    self.assertEqual(index.shape, (1, 2))
+                    tokens = np.fromfile(output / f'{split}.bin', dtype='<u2')
+                    original = (source / info['files'][split][0]).read_text()
+                    expected = tok.encode(sft_text_documents(original)[0]).ids
+                    self.assertEqual(tokens.tolist(), expected)
+                    self.assertNotIn('<conversation>', tok.decode(tokens.tolist(), skip_special_tokens=False))
+                    x, y = ds.batch(split, np.random.default_rng(5), 1, 'cpu')
+                    self.assertEqual(x[0, :len(tokens)-1].tolist(), tokens[:-1].tolist())
+                    self.assertTrue(bool(y[0, len(tokens)-1:].eq(-1).all()))
+                    self.assertTrue(bool(y.ne(-1).any()))
+            finally:
+                ds.close()
+            with self.assertRaises(ValueError):
+                sft_text_documents('<conversation><|user|> missing closing wrapper')
+
     def test_generation_rollover_greedy_and_validation(self):
         model = GPT(self.config(block_size=8)).eval()
         x = torch.arange(8).unsqueeze(0)
@@ -177,6 +215,23 @@ class RuntimeTests(unittest.TestCase):
                 self.assertTrue((out / 'agmgpt_5_it.pt').exists())
                 if name == 'time':
                     self.assertGreater(state['completed_steps'], 1)
+
+    def test_status_save_retries_transient_permission_errors(self):
+        from train import atomic_json
+        original_replace = Path.replace
+        calls = []
+        def locked_then_available(source, destination):
+            calls.append(source)
+            if len(calls) < 3:
+                raise PermissionError('Transient sharing violation')
+            return original_replace(source, destination)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'training.json'
+            with patch.object(Path, 'replace', locked_then_available), patch('checkpoint.time.sleep'):
+                atomic_json(path, {'status': 'training'})
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(json.loads(path.read_text()), {'status': 'training'})
+            self.assertEqual(list(Path(tmp).glob('*.tmp')), [])
 
     def test_server_missing_checkpoint_and_smoke_stream(self):
         from serve import start_server

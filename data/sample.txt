@@ -1,3 +1,4 @@
-<|user|> Hello! <|ai|> Hello! How can I help you today? <|eos|>
-
-<|user|> What is 2 + 3? <|ai|> 2 + 3 = 5. <|eos|>
+<conversation>
+<|user|> My cat Miso stole my seat again. <|ai|> Miso clearly has strong opinions about seating arrangements. Did you at least get a corner? <|eos|>
+<|user|> Nope, he took the whole chair. <|ai|> Impressive commitment. You might need to negotiate with treats, though Miso seems to hold all the cards. <|eos|>
+</conversation>

@@ -44,6 +44,30 @@ Pretraining supervises every next token. SFT supervises assistant tokens and EOS
 
 `--init-from` loads local weights with the same architecture and tokenizer into a fresh optimizer. It does not import arbitrary Hugging Face or native upstream checkpoints.
 
+## Multi-turn conversations
+
+Keep each conversation together, with exchanges in chronological order:
+
+```text
+<conversation>
+<|user|> My cat Miso stole my seat again. <|ai|> Miso clearly has strong opinions about seating arrangements. Did you at least get a corner? <|eos|>
+<|user|> Nope, he took the whole chair. <|ai|> Impressive commitment. You might need to negotiate with treats, though Miso seems to hold all the cards. <|eos|>
+</conversation>
+```
+
+`<conversation>` and `</conversation>` are plain dataset boundary markers. They are **not tokenizer special tokens**. `prepare.py` strips those wrappers before tokenization and keeps the existing `<|user|>`, `<|ai|>` and `<|eos|>` tokens. End each assistant turn with `<|eos|>`; the outer wrapper marks where the full conversation ends. Put one conversation per file when possible so file-level validation splitting also keeps complete conversations together.
+
+Preparation writes `train-conversations.npy` and `val-conversations.npy`, containing each conversation's token offset and length. The trainer samples a conversation, preserves its internal turn order, and masks user text and padding from the loss. Earlier assistant replies remain in the context for later user questions. Sampling whole conversations randomly is fine; **individual turns are never shuffled**. Short conversations are padded, and conversations longer than the context window are sampled as contiguous windows within that conversation. Legacy prepared streams without a boundary index keep their original contiguous-window sampling behavior.
+
+JSONL is also supported: each record can contain a `messages` array with alternating `user` and `assistant` roles and `content` strings. One record is one complete conversation. The sequence must start with a user and end with an assistant.
+
+```powershell
+& $py prepare.py --source data/new-instructions --output data/custom-sft --stage sft
+& $py train.py --data-dir data/custom-sft --init-from out/agmgpt_5_it.pt --device cuda
+```
+
+Prepare new data in a separate output directory. Do not overwrite a dataset used by a running trainer. New samples are used only when a training run explicitly loads the newly prepared dataset. Training code, these instructions, the tokenizer and a small format sample are distributed; the full training corpus and private API generator are not.
+
 ## Training
 
 Defaults: Muon for Transformer matrices, AdamW for other parameters, batch 1, accumulation 8, gradient clipping, warmup and cosine decay. Use `--optimizer adamw --lr 0.0003` for conventional AdamW; `--lr` only affects that option. Supported CUDA GPUs use BF16 compute. Optimizer compilation is disabled by default for Windows compatibility; set `TORCH_COMPILE_DISABLE=0` on a supported platform to enable it.
@@ -62,7 +86,7 @@ Defaults: Muon for Transformer matrices, AdamW for other parameters, batch 1, ac
 
 `--steps` is the total schedule length, including completed steps on resume; `--seconds` limits the current invocation. Resume restores optimizer and RNG state and validates the recipe. Create `STOP` (`STOP-smoke` for smoke runs) to save and stop at the next step boundary, then remove it before restarting. Ctrl+C leaves the last durable checkpoint; time limits are checked between steps.
 
-With `--target-loss`, the step cap is disabled. Training stops when the token-weighted training loss for a completed step falls strictly below the target, or when the invocation's time limit is reached. Validation loss remains a separate measure. A resumed target-loss run starts from the saved learning rates and decays them over the available time. Keep the original batch, accumulation, optimizer and schedule arguments for checkpoint compatibility.
+With `--target-loss`, the step cap is disabled. Training stops when the token-weighted training loss for a completed step reaches the target or less, or when the invocation's time limit is reached. Validation loss remains a separate measure. A resumed target-loss run starts from the saved learning rates and decays them over the available time. Keep the original batch, accumulation, optimizer and schedule arguments for checkpoint compatibility.
 
 - `out/latest.pt`: resumable model, optimizer, recipe and RNG state.
 - `out/agmgpt_5_it.pt`: inference snapshot, reloaded automatically by the chat server.
