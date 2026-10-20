@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+/out*/
+!/out/
+/out/*
+!/out/agmgpt_5_it.pt
+runs*/
+*.log
+*.pid
+STOP
+STOP-smoke
+/data/*
+!/data/tokenizer.json
+!/data/sample.txt

@@ -1,0 +1,13 @@
+{
+  "model_args": {
+    "block_size": 64,
+    "n_kv_head": 2,
+    "gradient_checkpointing": true,
+    "n_embd": 64,
+    "n_layer": 2,
+    "n_head": 4,
+    "vocab_size": 8192,
+    "window_pattern": "L"
+  },
+  "tokenizer_sha256": "5438988d2c1193ca7d74f5a67c5f2f5ad4a79c58bc0bed6d6975faec6f074131"
+}
