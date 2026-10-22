@@ -20,6 +20,18 @@ class RuntimeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(2)
+        cls._corpus_tmp = tempfile.TemporaryDirectory()
+        source = Path(cls._corpus_tmp.name) / 'source'
+        source.mkdir()
+        sample = (ROOT / 'data/sample.txt').read_text(encoding='utf-8')
+        for i in range(2):
+            (source / f'{i}.txt').write_text(sample.replace('Miso', f'Miso{i}'), encoding='utf-8')
+        cls.sample_data = Path(cls._corpus_tmp.name) / 'prepared'
+        prepare(source, cls.sample_data, 'sft')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._corpus_tmp.cleanup()
 
     def config(self, **overrides):
         values = dict(vocab_size=128, block_size=32, n_layer=2, n_head=4,
@@ -158,6 +170,7 @@ class RuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             def run(name, resume=False):
                 argv = ['train.py', '--config', 'config-smoke.json', '--steps', '4',
+                        '--data-dir', str(self.sample_data),
                         '--warmup', '2', '--batch', '1', '--accumulation', '2',
                         '--eval-batches', '1', '--save-every', '2', '--eval-every', '2',
                         '--no-server', '--device', 'cpu', '--out-dir', str(Path(tmp) / name),
@@ -199,6 +212,7 @@ class RuntimeTests(unittest.TestCase):
             ):
                 out, runs = Path(tmp) / name, Path(tmp) / (name + '-runs')
                 argv = ['train.py', '--config', 'config-smoke.json', '--steps', '1',
+                        '--data-dir', str(self.sample_data),
                         '--warmup', '0', '--batch', '1', '--accumulation', '1',
                         '--eval-batches', '1', '--no-server', '--device', 'cpu',
                         '--target-loss', target, '--seconds', seconds,
@@ -232,6 +246,52 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(len(calls), 3)
             self.assertEqual(json.loads(path.read_text()), {'status': 'training'})
             self.assertEqual(list(Path(tmp).glob('*.tmp')), [])
+
+    def test_dataset_switch_requires_opt_in_and_keeps_optimizer_settings(self):
+        from train import validate_resume_recipe
+        old = dict(optimizer='muon', batch=1, steps=1000, data_fingerprint='old')
+        new = dict(old, data_fingerprint='new')
+        self.assertFalse(validate_resume_recipe(old, old))
+        with self.assertRaises(ValueError):
+            validate_resume_recipe(old, new)
+        self.assertTrue(validate_resume_recipe(old, new, allow_data_change=True))
+        with self.assertRaises(ValueError):
+            validate_resume_recipe(old, dict(new, batch=2), allow_data_change=True)
+
+    def test_resume_new_corpus_preserves_optimizer_and_archives_validation(self):
+        import train
+        from checkpoint import read_checkpoint
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out, runs = root / 'out', root / 'runs'
+            common = ['train.py', '--config', 'config-smoke.json', '--optimizer', 'adamw',
+                      '--data-dir', str(self.sample_data),
+                      '--steps', '2', '--warmup', '0', '--accumulation', '1', '--eval-batches', '1',
+                      '--eval-every', '1', '--save-every', '1', '--device', 'cpu', '--no-server',
+                      '--out-dir', str(out), '--runs-dir', str(runs)]
+            with patch('sys.argv', common):
+                train.main()
+            before = read_checkpoint(out / 'latest.pt')
+            source = root / 'source'
+            source.mkdir()
+            for i in range(2):
+                (source / f'{i}.txt').write_text(
+                    f'<conversation><|user|> My pet is named Pip{i}. <|ai|> Pip{i} is a lovely name. <|eos|>\n'
+                    f'<|user|> What is my pet called? <|ai|> Your pet is Pip{i}. <|eos|></conversation>')
+            corpus = root / 'corpus'
+            prepare(source, corpus, 'sft')
+            with patch('sys.argv', common + ['--resume', '--allow-data-change', '--data-dir', str(corpus),
+                                            '--target-loss', '20', '--seconds', '60']):
+                train.main()
+            after = read_checkpoint(out / 'latest.pt')
+            self.assertEqual((before['step'], after['step']), (2, 3))
+            self.assertNotEqual(before['recipe']['data_fingerprint'], after['recipe']['data_fingerprint'])
+            self.assertEqual(max(float(s['step']) for s in after['optimizer']['state'].values()), 3.)
+            state = json.loads((runs / 'training.json').read_text())
+            self.assertEqual(state['data_change']['at_step'], 2)
+            self.assertTrue((runs / state['data_change']['previous_metrics']).exists())
+            self.assertTrue((out / 'best-before-data-change-2.pt').exists())
+            self.assertEqual(len((runs / 'metrics.jsonl').read_text().splitlines()), 1)
 
     def test_server_missing_checkpoint_and_smoke_stream(self):
         from serve import start_server
@@ -274,6 +334,7 @@ class RuntimeTests(unittest.TestCase):
                        '--out-dir', str(root / 'base'), '--runs-dir', str(root / 'base-runs')]):
                 train.main()
             with patch('sys.argv', common + ['--stage', 'sft', '--init-from', str(root / 'base/agmgpt_5_it.pt'),
+                       '--data-dir', str(self.sample_data),
                        '--out-dir', str(root / 'sft'), '--runs-dir', str(root / 'sft-runs')]):
                 train.main()
             self.assertEqual(read_checkpoint(root / 'base/agmgpt_5_it.pt')['stage'], 'pretrain')

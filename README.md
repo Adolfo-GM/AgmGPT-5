@@ -4,15 +4,19 @@
 
 A 40M LLM based on Andrej Karpathy's [nanochat](https://github.com/karpathy/nanochat), with local pretraining, instruction fine-tuning, evaluation, and a modern streaming chat interface.
 
+The latest checkpoint was trained on an **approximately 1B-token conversation corpus** combining custom data with cleaned SmolTalk examples. The prepared corpus contains **947,404,187 training tokens** and **9,986,930 validation tokens**, measured with the included 8,192-token vocabulary. These figures describe the corpus size; the model has **not completed a full pass through it**.
+
+Published checkpoint: **step 52,214**, 39,846,122 parameters, 1,024-token context. Training supports ordered multi-turn conversations, weighted custom/imported data sampling, and checkpointed coverage cursors. The current checkpoint remains experimental and can produce repetitive or incoherent answers. Full datasets and private generation scripts are not distributed.
+
 ## Run
 
 ```powershell
-.\start.ps1
-# Tiny pipeline check:
-.\start.ps1 -Smoke
+python serve.py --port 8785
+# Pipeline checks using small temporary test data:
+python -m unittest test_runtime test_weighted_data test_coverage
 ```
 
-Chat: <http://127.0.0.1:8785/> · Stats: <http://127.0.0.1:8785/stats>. The server stays open after training; Ctrl+C exits.
+Chat: <http://127.0.0.1:8785/> · Stats: <http://127.0.0.1:8785/stats>. The chat server uses the included weights and does not require the training corpus. Ctrl+C exits. To train after preparing your own corpus, use `.\start.ps1` or the commands below.
 
 Create a Python environment and install the dependencies:
 
@@ -61,12 +65,33 @@ Preparation writes `train-conversations.npy` and `val-conversations.npy`, contai
 
 JSONL is also supported: each record can contain a `messages` array with alternating `user` and `assistant` roles and `content` strings. One record is one complete conversation. The sequence must start with a user and end with an assistant.
 
+Prepared datasets can include `sampling-groups.json` to control how often each source is sampled. For example, this mix selects a custom conversation 60% of the time and an imported conversation 40% of the time, regardless of their relative dataset sizes:
+
+```json
+[
+  {"name": "custom", "weight": 0.6, "train": [0, 43066], "val": [0, 2166]},
+  {"name": "huggingface", "weight": 0.4, "train": [43066, 100000], "val": [2166, 1000]}
+]
+```
+
+Each range is `[first_conversation_index, conversation_count]`, referring to the prepared `*-conversations.npy` files; replace the example counts with the actual corpus counts. Ranges must be contiguous, disjoint and cover the full split. Weights must be finite and positive and are normalized automatically. A source is selected first, then a conversation uniformly within that source. Turn order and assistant-only loss masks are preserved. These are sampling probabilities, not token quotas or multipliers on the loss. Validation records `val_loss_by_group` and a weighted aggregate. Weight changes alter the dataset fingerprint and require an explicit `--allow-data-change` resume.
+
+Use `--sampling coverage` to replace random conversation/window selection with complete passes through each source. Each source shuffles its conversation order at the start of an epoch, then visits successive windows within each conversation in order. Adjacent windows share one boundary token so that every next-token target is covered. Windows without assistant targets are traversed but do not produce an optimizer update. Padding and user tokens remain excluded from the loss. In this mode source weights apply to **window draws**; a smaller custom source can complete multiple passes while the larger source continues its first pass. Validation remains fixed random sampling for comparable measurements.
+
+Coverage cursors and epoch seeds are saved in `latest.pt`, and normal `--resume` restores the sampler automatically. `runs/training.json` reports per-source epoch progress. A time limit can end a run before a full pass; future resumes continue from that saved cursor. Metrics now record actual non-padding input tokens and supervised target tokens measured since `measured_since_step`, alongside the older `tokens` counter that includes padding. Historical actual-token counts are unknown and are not invented.
+
+To deliberately raise learning rates from a saved checkpoint, use `--resume --restart-lr-scale 10 --restart-warmup 100`. This retains model weights and optimizer moments, multiplies each saved group learning rate by ten, ramps up over 100 steps, holds the rate, then decays during the final tenth of the time budget. The schedule and its elapsed time are saved for subsequent resumes. This is an explicit schedule restart; a normal resume retains the saved schedule.
+
+The optional local Hugging Face import uses the Apache-2.0 subsets of [SmolTalk](https://huggingface.co/datasets/HuggingFaceTB/smoltalk), with [SmolTalk2](https://huggingface.co/datasets/HuggingFaceTB/smoltalk2) versions of those same subsets as a fallback. Source revisions and filtering counts are retained with the private corpus. Imported text, downloads and generated token streams remain excluded from Git. The original source notices and provenance remain intact.
+
 ```powershell
 & $py prepare.py --source data/new-instructions --output data/custom-sft --stage sft
 & $py train.py --data-dir data/custom-sft --init-from out/agmgpt_5_it.pt --device cuda
 ```
 
 Prepare new data in a separate output directory. Do not overwrite a dataset used by a running trainer. New samples are used only when a training run explicitly loads the newly prepared dataset. Training code, these instructions, the tokenizer and a small format sample are distributed; the full training corpus and private API generator are not.
+
+To add data to an existing run, stop at a saved step and use `--resume --allow-data-change --data-dir data/custom-sft` with the original optimizer, batch and schedule arguments. This retains model weights, optimizer state and global step. The trainer archives the previous metrics and best-validation checkpoint, resets validation comparisons for the new held-out split, and starts a fresh data-sampling RNG. Normal resume still rejects unexpected dataset changes.
 
 ## Training
 
@@ -100,7 +125,7 @@ With `--target-loss`, the step cap is disabled. Training stops when the token-we
 & $py evaluate.py --checkpoint out/base/agmgpt_5_it.pt --data-dir data/pretrain --stage pretrain --device cuda
 & $py chat.py --checkpoint out/agmgpt_5_it.pt --device cuda
 & $py serve.py --port 8785
-& $py -m unittest test_runtime -v
+& $py -m unittest test_runtime test_weighted_data test_coverage -v
 ```
 
 Evaluation reports fixed-window held-out loss and perplexity. Web chat runs inference on CPU so it can coexist with GPU training. Checkpoints validate tokenizer identity and are loaded with `weights_only=True`.
