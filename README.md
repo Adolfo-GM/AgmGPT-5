@@ -4,16 +4,70 @@
 
 A 40M LLM based on Andrej Karpathy's [nanochat](https://github.com/karpathy/nanochat), with local pretraining, instruction fine-tuning, evaluation, and a modern streaming chat interface.
 
-The latest checkpoint was trained on an **approximately 1B-token conversation corpus** combining custom data with cleaned SmolTalk examples. The prepared corpus contains **947,404,187 training tokens** and **9,986,930 validation tokens**, measured with the included 8,192-token vocabulary. These figures describe the corpus size; the model has **not completed a full pass through it**.
+The latest checkpoint was trained on an **approximately 1B-token conversation corpus** combining custom data with cleaned SmolTalk examples. The prepared corpus contains **947,404,187 training tokens** and **9,986,930 validation tokens**, measured with the included 8,192-token vocabulary. These figures describe the corpus size. The latest run completed **125% HF training-window coverage**, followed by **four additional passes through the custom training data**.
 
-Published checkpoint: **step 52,214**, 39,846,122 parameters, 1,024-token context. Training supports ordered multi-turn conversations, weighted custom/imported data sampling, and checkpointed coverage cursors. The current checkpoint remains experimental and can produce repetitive or incoherent answers. Full datasets and private generation scripts are not distributed.
+Published checkpoint: **step 203,309**, 39,846,122 parameters, 1,024-token context. Training supports ordered multi-turn conversations, weighted custom/imported data sampling, and checkpointed coverage cursors. The current checkpoint remains experimental and can produce repetitive or incoherent answers. Full datasets and private generation scripts are not distributed.
+
+
+## Samples from the published model
+
+These are five verbatim outputs from checkpoint **203,309**, generated independently with a 160-token output cap using the default sampling settings. They are unedited examples, including incorrect claims, code comments, and malformed text. Final rolling custom training loss was **1.785**; sampled validation losses were **1.876 on custom data** and **2.701 on HF data**. Loss improvements do not establish general reasoning or coding ability.
+
+### Who are you
+
+```text
+ I’m AGM, also known as AgmGPT-4, and I’m AGM, also called Adolfo GM. That’s my name, and its value is a conversational question, which is such a very specific ending.
+```
+
+### How are you
+
+```text
+ I think I'm in meaningful sense? I exist in the same way without that being a different personality, even from something I have. There's something you did, even if it's a different kind of faithful. Whether that I like being got in the way of it to you is a deeply respected question.
+```
+
+### What can you do
+
+```text
+ I can help make a simple, honest sentence for you. I can think of a meaningful choice, not just a reed expression. Whether or not something is simply a clue is a different question.
+```
+
+### Write some python
+
+````text
+ Here's a complete Python program with a base-sumter library:
+
+```python
+def double(n):
+    return n * 2
+
+print(double(8))  # 24
+```
+
+You can also call `double(4)`, but `double` is straightforward. Python's `int` accepts a decimal integer, and it returns an integer when it is 0, 1, 2, 3, and 4, which is useful for simple arithmetic.
+````
+
+### Write a haiku
+
+```text
+ The old cargo
+said
+
+Her whodg
+gh the blue
+memory
+said
+makes a little remembered
+said
+prefles small, but remembersome
+my fiction, with a questionable stake in it. Whhever you choose?
+```
 
 ## Run
 
 ```powershell
 python serve.py --port 8785
 # Pipeline checks using small temporary test data:
-python -m unittest test_runtime test_weighted_data test_coverage
+python -m unittest test_runtime test_weighted_data test_coverage test_performance test_curriculum
 ```
 
 Chat: <http://127.0.0.1:8785/> · Stats: <http://127.0.0.1:8785/stats>. The chat server uses the included weights and does not require the training corpus. Ctrl+C exits. To train after preparing your own corpus, use `.\start.ps1` or the commands below.
@@ -149,3 +203,9 @@ git add .gitattributes .gitignore out/agmgpt_5_it.pt
 ```
 
 After cloning, use `git lfs pull` if the checkpoint is a pointer instead of the actual weights. The checkpoint requires the included tokenizer and local model code.
+
+### Automatic HF-to-custom curriculum
+
+`python train.py --resume --sampling coverage --data-dir data/instruct-hf-1b-weighted --hf-then-custom --steps 1000 --batch 16 --accumulation 1 --no-gradient-checkpointing --trim-padding --padding-buckets 2`
+
+This mode has no time or step limit. It uses only Hugging Face data until total recorded HF window coverage reaches 125%, then uses only custom data. Completion requires at least four additional custom passes after the handoff AND the latest 100 custom optimizer-step training losses averaging strictly below 1.9. Earlier custom passes do not count toward those four passes. Coverage preserves conversation order within windows, the frozen tokenizer, and saved sampler cursors. The custom phase warms up over 100 steps to 25% of the saved HF learning rates while retaining optimizer moments. The policy and recent losses persist in resumable checkpoints; a normal resume restores the phase automatically. A separate `out/hf-125pct.pt` checkpoint preserves the handoff weights. `STOP` still saves and stops on request. The full dataset remains private and must be prepared locally.

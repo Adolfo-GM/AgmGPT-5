@@ -11,9 +11,10 @@ from dataclasses import asdict
 from pathlib import Path
 import numpy as np
 import torch
-from model import GPT, GPTConfig, size_report
+from model import GPT, GPTConfig, size_report, CheckpointBlock
 from checkpoint import save_checkpoint, read_checkpoint, tokenizer_hash, replace_with_retry
 from sampling import CoverageSampler, restarted_lr_factor
+from curriculum import CoverageCurriculum
 
 ROOT = Path(__file__).resolve().parent
 
@@ -28,6 +29,22 @@ def validate_resume_recipe(saved, expected, allow_data_change=False):
     if changed and not allow_data_change:
         raise ValueError('Resume dataset differs; pass --allow-data-change to switch data while retaining optimizer state')
     return changed
+
+
+def trimmed_batches(x, y, buckets=1, input_lengths=None):
+    """Crop trailing unsupervised positions; isolate conversations in batch rows.
+
+    Sorting only within the already sampled update preserves sampler cursors.
+    Causal attention means removing trailing positions cannot change scored tokens.
+    """
+    positions = torch.arange(y.size(1), device=y.device) + 1
+    lengths = torch.where(y.ne(-1), positions, 0).amax(dim=1).clamp(min=2)
+    if input_lengths is not None:
+        lengths = torch.as_tensor(input_lengths, device=y.device).clamp(min=2)
+    order = lengths.argsort()
+    for rows in order.tensor_split(min(buckets, len(order))):
+        end = int(lengths[rows].max())
+        yield x[rows, :end].contiguous(), y[rows, :end].contiguous()
 
 
 def dataset_fingerprint(directory, stage):
@@ -115,6 +132,7 @@ class TokenDataset:
             raise ValueError('Coverage sampling requires indexed conversations')
         self.coverage = CoverageSampler(self.conversations['train'], context, self.groups) if sampling == 'coverage' else None
         self.last_batch_input_tokens = 0
+        self.last_batch_input_lengths = []
 
     def close(self):
         for tokens, mask in self.streams.values():
@@ -128,6 +146,7 @@ class TokenDataset:
         tokens, mask = self.streams[split]
         xs, ys = [], []
         self.last_batch_input_tokens = 0
+        self.last_batch_input_lengths = []
         for _ in range(count):
             bounds = None
             choice = 0
@@ -169,6 +188,7 @@ class TokenDataset:
                     break
             else:
                 raise ValueError('No supervised targets in sampled windows')
+            self.last_batch_input_lengths.append(size if split in self.conversations else self.context)
             xs.append(x)
             ys.append(y)
             self.last_batch_input_tokens += size if split in self.conversations else self.context
@@ -205,6 +225,15 @@ def main():
     resume.add_argument('--init-from', help='Initialize weights only, e.g. a base checkpoint for SFT')
     p.add_argument('--allow-data-change', action='store_true',
                    help='With --resume, retain weights/optimizer but switch corpus and reset validation history')
+    p.add_argument('--hf-then-custom', action='store_true', help='No time limit: HF to 125%, then four new custom passes AND mean custom training loss <1.9')
+    p.add_argument('--curriculum-loss-window', type=int, default=100)
+    p.add_argument('--curriculum-loss-target', type=float, default=1.9)
+    p.add_argument('--train-source', help='Restrict training draws to one named source; validation remains per-source')
+    p.add_argument('--no-gradient-checkpointing', action='store_true', default=None)
+    p.add_argument('--trim-padding', action='store_true', default=None)
+    p.add_argument('--padding-buckets', type=int, default=None)
+    p.add_argument('--allow-effective-batch-change', action='store_true', help='Explicitly permit a different effective batch while preserving optimizer state')
+    p.add_argument('--allow-batch-change', action='store_true', help='Allow a different microbatch shape with the same effective batch')
     p.add_argument('--sampling', choices=['random','coverage'],
                    help='Training sampler; defaults to the checkpoint mode when resuming')
     p.add_argument('--restart-lr-scale', type=float,
@@ -239,6 +268,8 @@ def main():
         p.error('Training limits and LR must be positive; warmup must be nonnegative')
     if args.target_loss is not None and (not math.isfinite(args.target_loss) or args.target_loss <= 0):
         p.error('--target-loss must be finite and positive')
+    if args.padding_buckets is not None and args.padding_buckets < 1:
+        p.error('--padding-buckets must be positive')
     raw = json.loads((ROOT / args.config).read_text())
     c = GPTConfig(**raw['model_args'])
     smoke = Path(args.config).stem == 'config-smoke'
@@ -259,6 +290,13 @@ def main():
     if data_info.get('tokenizer_sha256') != sha or data_info['vocab_size'] != c.vocab_size:
         raise ValueError('Dataset tokenizer or vocabulary mismatch')
     saved = read_checkpoint(out / 'latest.pt' if args.resume else args.init_from, sha) if args.resume or args.init_from else None
+    performance = saved.get('performance', {}) if args.resume else {}
+    if args.no_gradient_checkpointing is None:
+        args.no_gradient_checkpointing = not performance.get('gradient_checkpointing', True)
+    if args.trim_padding is None:
+        args.trim_padding = performance.get('trim_padding', False)
+    if args.padding_buckets is None:
+        args.padding_buckets = performance.get('padding_buckets', 1)
     sampling_mode = args.sampling or (saved.get('sampling_mode','random') if args.resume else 'random')
     dataset = TokenDataset(data_dir, c.block_size, args.stage, c.vocab_size, sampling=sampling_mode)
     data_id = dataset_fingerprint(data_dir, args.stage)
@@ -270,6 +308,10 @@ def main():
     torch.manual_seed(1337)
     rng = np.random.default_rng(1337)
     model = GPT(c).to(device)
+    if args.no_gradient_checkpointing:
+        for block in model.core.transformer.h:
+            if isinstance(block, CheckpointBlock):
+                block.enabled = False
     optimizer = model.setup_optimizer(args.optimizer, args.lr, args.weight_decay)
     completed, best = 0, float('inf')
     data_changed = False
@@ -289,6 +331,10 @@ def main():
                 if old_directory.resolve() != data_dir.resolve() and not args.allow_data_change:
                     raise ValueError('Legacy resume dataset differs')
                 saved_recipe['data_fingerprint'] = data_id if old_directory.resolve() == data_dir.resolve() else 'legacy-other-data'
+            if args.allow_batch_change or args.allow_effective_batch_change:
+                if not args.allow_effective_batch_change and saved_recipe['batch'] * saved_recipe['accumulation'] != args.batch * args.accumulation:
+                    raise ValueError('Batch reshaping must preserve effective batch size')
+                saved_recipe['batch'], saved_recipe['accumulation'] = args.batch, args.accumulation
             data_changed = validate_resume_recipe(saved_recipe, expected, args.allow_data_change)
             optimizer.load_state_dict(saved['optimizer'])
             completed, best = saved['step'], saved['best_val_loss']
@@ -302,6 +348,19 @@ def main():
                 torch.cuda.set_rng_state_all(saved['cuda_rng'])
             if dataset.coverage is not None and saved.get('sampling_mode') == 'coverage' and not data_changed:
                 dataset.coverage.load_state_dict(saved['sampler_state'])
+    training_source = args.train_source or (saved.get('training_source') if args.resume else None)
+    if training_source and training_source not in [g['name'] for g in dataset.groups]:
+        raise ValueError('Unknown training source')
+    curriculum = None
+    if args.hf_then_custom or (args.resume and saved.get('curriculum')):
+        if data_changed or dataset.coverage is None or not {'custom','huggingface'}.issubset(g['name'] for g in dataset.groups):
+            raise ValueError('Curriculum requires the unchanged two-source coverage dataset')
+        curriculum = CoverageCurriculum(dataset.coverage.progress(),
+            saved=saved.get('curriculum') if args.resume else None,
+            loss_target=args.curriculum_loss_target, loss_window=args.curriculum_loss_window)
+        if 'base_group_lrs' not in curriculum.state:
+            curriculum.state['base_group_lrs'] = [g['lr'] for g in optimizer.param_groups]
+        training_source = curriculum.source
     recipe = dict(stage=args.stage, optimizer=args.optimizer, batch=args.batch,
                   accumulation=args.accumulation, lr=args.lr, weight_decay=args.weight_decay,
                   warmup=args.warmup, steps=args.steps, data_fingerprint=data_id)
@@ -319,10 +378,14 @@ def main():
         (runs / 'metrics.jsonl').write_text('')
     state = dict(model='AgmGPT-5-It', status='training', stage=args.stage,
                  optimizer=args.optimizer, model_args=asdict(c), **size_report(c),
-                 training=dict(max_seconds=args.seconds, max_iters=None if args.target_loss is not None else args.steps,
-                               target_loss=args.target_loss, resume_step=completed,
+                 training=dict(max_seconds=None if curriculum else args.seconds, max_iters=None if curriculum or args.target_loss is not None else args.steps,
+                               target_loss=curriculum.state['loss_target'] if curriculum else args.target_loss, resume_step=completed,
                                accumulation=args.accumulation, batch=args.batch), dataset=data_info,
-                 sampling_groups=dataset.groups, sampling_mode=sampling_mode)
+                 sampling_groups=dataset.groups, sampling_mode=sampling_mode, training_source=training_source)
+    if curriculum:
+        state['curriculum'] = curriculum.report(dataset.coverage.progress())
+        state['training']['completion_rule'] = 'HF >=125%; then >=400% new custom coverage AND last100 custom training losses average <1.9'
+    state['performance'] = dict(gradient_checkpointing=not args.no_gradient_checkpointing, trim_padding=args.trim_padding, padding_buckets=args.padding_buckets)
     if data_changed:
         state['data_change'] = dict(at_step=completed, from_fingerprint=saved_recipe['data_fingerprint'],
                                    to_fingerprint=data_id, previous_metrics=history_archive,
@@ -357,12 +420,17 @@ def main():
         state['learning_rate_restart'] = dict(multiplier=args.restart_lr_scale,
             base_group_lrs=restart_plan['base_lrs'], warmup=restart_plan['warmup'], schedule='warmup-hold-final-10-percent-decay')
 
+    if curriculum:
+        state['learning_rate_restart'] = dict(schedule='HF hold; custom 25 percent with 100-step warmup', base_group_lrs=curriculum.state['base_group_lrs'])
+
     def save():
         common = dict(step=completed, best_val_loss=best if math.isfinite(best) else None,
                       stage=args.stage)
         save_checkpoint(model, out / 'latest.pt', sha, optimizer=optimizer.state_dict(),
                         recipe=recipe,
-                        sampling_mode=sampling_mode,
+                        curriculum=curriculum.state if curriculum else None,
+                        performance=state['performance'],
+                        sampling_mode=sampling_mode, training_source=training_source,
                         sampler_state=dataset.coverage.state_dict() if dataset.coverage else None,
                         restart_plan=(dict(restart_plan, elapsed_seconds=restart_elapsed+time.monotonic()-begin) if restart_plan else None),
                         measured_input_tokens=processed_inputs, measured_target_tokens=processed_targets,
@@ -373,13 +441,25 @@ def main():
 
     try:
         model.train()
-        steps = itertools.count(completed + 1) if args.target_loss is not None else range(completed + 1, args.steps + 1)
+        steps = itertools.count(completed + 1) if curriculum or args.target_loss is not None else range(completed + 1, args.steps + 1)
         for step in steps:
             stop_file = ROOT / ('STOP-smoke' if smoke else 'STOP')
             if stop_file.exists():
                 reason, status = 'stop_requested', 'stopped'
                 break
-            if time.monotonic() - begin >= args.seconds:
+            if curriculum:
+                if curriculum.advance(dataset.coverage.progress(), completed):
+                    training_source = curriculum.source
+                    state['training_source'] = training_source
+                    state['curriculum'] = curriculum.report(dataset.coverage.progress())
+                    save_checkpoint(model, out / 'hf-125pct.pt', sha, step=completed, stage=args.stage)
+                    save()
+                    print(json.dumps(dict(event='curriculum_custom_start', step=completed,
+                        curriculum=state['curriculum'])), flush=True)
+                if curriculum.complete(dataset.coverage.progress()):
+                    reason = 'curriculum_complete'
+                    break
+            if not curriculum and time.monotonic() - begin >= args.seconds:
                 reason = 'time_limit'
                 break
             warmup = min(1., step / max(1, args.warmup))
@@ -389,7 +469,10 @@ def main():
                 if args.resume:
                     warmup = 1.
             factor = warmup * (.1 + .9 * .5 * (1 + math.cos(math.pi * progress)))
-            if restart_plan:
+            if curriculum:
+                factor = curriculum.lr_factor(step)
+                base_lrs = curriculum.state['base_group_lrs']
+            elif restart_plan:
                 factor = restarted_lr_factor(step, restart_plan['restart_step'], restart_plan['warmup'],
                     restart_elapsed+time.monotonic()-begin, restart_plan['duration_seconds'])
                 base_lrs = restart_plan['base_lrs']
@@ -400,7 +483,8 @@ def main():
             batches = []
             input_count = 0
             for _ in range(args.accumulation):
-                batches.append(dataset.batch('train', rng, args.batch, device))
+                x, y = dataset.batch('train', rng, args.batch, device, group=training_source)
+                batches.extend(trimmed_batches(x, y, args.padding_buckets, dataset.last_batch_input_lengths) if args.trim_padding else [(x, y)])
                 input_count += dataset.last_batch_input_tokens
             target_count = sum(int(y.ne(-1).sum()) for _, y in batches)
             total_loss = 0.
@@ -422,17 +506,21 @@ def main():
                        measured_input_tokens=processed_inputs, measured_target_tokens=processed_targets,
                        measured_since_step=measured_since_step,
                        gpu_peak_mb=torch.cuda.max_memory_allocated() / 2**20 if device == 'cuda' else 0)
-            target_reached = args.target_loss is not None and total_loss <= args.target_loss
+            if curriculum:
+                curriculum.record_loss(total_loss)
+                row['training_source'] = training_source
+                row['curriculum'] = curriculum.report(dataset.coverage.progress())
+            target_reached = curriculum.complete(dataset.coverage.progress()) if curriculum else args.target_loss is not None and total_loss <= args.target_loss
             restart_first = step == start_step+1 and (args.restart_lr_scale is not None or (sampling_mode == 'coverage' and (not saved or saved.get('sampling_mode') != 'coverage')))
             if step == 1 or step % args.eval_every == 0 or (data_changed and step == start_step + 1) or restart_first or (args.target_loss is None and step == args.steps) or target_reached:
                 if dataset.groups:
                     row['val_loss_by_group'] = {g['name']: evaluate(
-                        model, dataset, args.eval_batches, args.batch, device, group=g['name'])
+                        model, dataset, args.eval_batches, min(args.batch, 8), device, group=g['name'])
                         for g in dataset.groups}
                     row['val_loss'] = sum(float(p) * row['val_loss_by_group'][g['name']]
                                           for p, g in zip(dataset.group_probabilities, dataset.groups))
                 else:
-                    row['val_loss'] = evaluate(model, dataset, args.eval_batches, args.batch, device)
+                    row['val_loss'] = evaluate(model, dataset, args.eval_batches, min(args.batch, 8), device)
                 if not math.isfinite(row['val_loss']):
                     raise FloatingPointError('Non-finite validation loss')
                 if row['val_loss'] < best:
@@ -448,9 +536,11 @@ def main():
                          measured_input_tokens=processed_inputs, measured_target_tokens=processed_targets,
                          measured_since_step=measured_since_step,
                          coverage=dataset.coverage.progress() if dataset.coverage else None)
+            if curriculum:
+                state['curriculum'] = curriculum.report(dataset.coverage.progress())
             atomic_json(runs / 'training.json', state)
             if target_reached:
-                reason = 'loss_target'
+                reason = 'curriculum_complete' if curriculum else 'loss_target'
                 break
         save()
     except KeyboardInterrupt:

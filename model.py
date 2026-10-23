@@ -42,9 +42,10 @@ class CheckpointBlock(torch.nn.Module):
     def __init__(self, block):
         super().__init__()
         self.block = block
+        self.enabled = True
 
     def forward(self, *args):
-        if self.training and torch.is_grad_enabled():
+        if self.enabled and self.training and torch.is_grad_enabled():
             return checkpoint(self.block, *args, use_reentrant=False)
         return self.block(*args)
 
